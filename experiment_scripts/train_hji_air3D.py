@@ -69,7 +69,7 @@ if opt.counter_start == -1:
 if opt.counter_end == -1:
   opt.counter_end = opt.num_epochs
 
-dataset = dataio.ReachabilityAir3DSource(numpoints=65000, collisionR=opt.collisionR, velocity=opt.velocity, 
+dataset = dataio.ReachabilityAir3DSource(numpoints=2, collisionR=opt.collisionR, velocity=opt.velocity, 
                                           omega_max=opt.omega_max, pretrain=opt.pretrain, tMin=opt.tMin,
                                           tMax=opt.tMax, counter_start=opt.counter_start, counter_end=opt.counter_end,
                                           pretrain_iters=opt.pretrain_iters, seed=opt.seed,
@@ -77,6 +77,10 @@ dataset = dataio.ReachabilityAir3DSource(numpoints=65000, collisionR=opt.collisi
                                           num_src_samples=opt.num_src_samples)
 
 dataloader = DataLoader(dataset, shuffle=True, batch_size=opt.batch_size, pin_memory=True, num_workers=0)
+
+# model_output, gt = next(iter(dataloader))
+# print(model_output['coords'])
+# print(gt['source_boundary_values'])
 
 model = modules.SingleBVPNet(in_features=4, out_features=1, type=opt.model, mode=opt.mode,
                              final_layer_factor=1., hidden_features=opt.num_nl, num_hidden_layers=opt.num_hl)
@@ -131,10 +135,10 @@ def val_fn(model, ckpt_dir, epoch):
       ax = fig.add_subplot(num_times, num_thetas, (j+1) + i*num_thetas)
       ax.set_title('t = %0.2f, theta = %0.2f' % (times[i], thetas[j]))
       s = ax.imshow(model_out.T, cmap='bwr', origin='lower', extent=(-1., 1., -1., 1.))
-      fig.colorbar(s) 
+      fig.colorbar(s)
 
   fig.savefig(os.path.join(ckpt_dir, 'BRS_validation_plot_epoch_%04d.png' % epoch))
-  
+
 
 training.train(model=model, train_dataloader=dataloader, epochs=opt.num_epochs, lr=opt.lr,
                steps_til_summary=opt.steps_til_summary, epochs_til_checkpoint=opt.epochs_til_ckpt,

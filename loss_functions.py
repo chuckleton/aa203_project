@@ -1,5 +1,7 @@
 import torch
 import torch.nn.functional as F
+from pytorch3d.transforms import quaternion_apply, quaternion_invert
+import numpy as np
 
 import diff_operators
 import modules, utils
@@ -107,6 +109,7 @@ def initialize_hji_air3D(dataset, minWith):
             ham = torch.clamp(ham, max=0.0)
 
         if torch.all(dirichlet_mask):
+            print('pretrain')
             diff_constraint_hom = torch.Tensor([0])
         else:
             diff_constraint_hom = dudt - ham
@@ -120,3 +123,132 @@ def initialize_hji_air3D(dataset, minWith):
                 'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
 
     return hji_air3D
+
+
+def initialize_hji_attitude(dataset, minWith):
+    # Initialize the loss function for the air3D problem
+    # The dynamics parameters
+    thrust = dataset.thrust
+    omega_max = dataset.omega_max
+    ang_rate_max = dataset.ang_rate_max
+    alpha_angle = dataset.theta_max
+    J = dataset.J
+    J_inv = dataset.J_inv
+    l = dataset.l
+    M = dataset.M
+
+    def hji_attitude(model_output, gt):
+        source_boundary_values = gt['source_boundary_values']
+        x = model_output['model_in']  # (meta_batch_size, num_points, 12)
+        y = model_output['model_out']  # (meta_batch_size, num_points, 1)
+        dirichlet_mask = gt['dirichlet_mask']
+        batch_size = x.shape[1]
+
+        du, status = diff_operators.jacobian(y, x)
+        dudt = du[..., 0, 0]
+        dudx = du[..., 0, 1:]
+
+        x_theta = x[..., 7:]
+        x_omega = x[..., 4:7]
+
+        # Scale the costate for theta appropriately to align with the range of [-pi, pi]
+        dudx[..., 6:] = dudx[..., 6:] / alpha_angle
+        dudx[..., 3:6] = dudx[..., 3:6] / ang_rate_max
+        # Scale the coordinates
+        x_theta = alpha_angle * x_theta
+        x_omega = ang_rate_max * x_omega
+
+        # Air3D dynamics
+        # \dot x    = -v_a + v_b \cos \psi + a y
+        # \dot y    = v_b \sin \psi - a x
+        # \dot \psi = b - a
+
+        # Compute the hamiltonian for the ego vehicle
+        # Control component
+
+        # Inverse state transformation
+        q = torch.cat(
+            (1 - torch.norm(x[..., 1:4], dim=-1, keepdim=True), x[..., 1:4]), dim=-1)
+        q_inv = quaternion_invert(q).cuda()
+        q0 = q[..., 0][..., None]
+
+        omega = (2/q0)*(q0**2*x_omega + \
+                               x[..., 1:4] * torch.sum(x[..., 1:4]* x_omega, dim=-1)[..., None]
+                               - q0 * torch.linalg.cross(x[..., 1:4], x_omega, dim=-1))
+
+        Omega = torch.matmul(J, omega.mT).mT
+
+
+        # Quaternion dynamics
+        ham = torch.sum(dudx[..., 1:4] * x_omega, dim=-1)
+        # Rate dynamics
+        taus = torch.zeros(x.shape[0], x.shape[1], 3, 3).cuda()
+        for i in range(M):
+            R_nb = torch.stack([torch.cos(x_theta[..., 2*i])*torch.cos(x_theta[..., 2*i+1]),
+                                torch.cos(x_theta[..., 2*i])*torch.sin(x_theta[..., 2*i+1]),
+                                -torch.sin(x_theta[..., 2*i])],
+                                dim=-1)
+            taus[..., i] = torch.linalg.cross(l[i][None, None, :], R_nb, dim=-1)
+        for i in range(M):
+            tau_b = torch.zeros_like(taus[..., 0]).cuda()
+            for j in range(M):
+                if i != j:
+                    tau_b += taus[..., j]
+            tau_w_i = quaternion_apply(q_inv, tau_b)
+            u_tilde_i = 0.5*(q0*(J_inv@tau_w_i.mT).mT +
+                             torch.linalg.cross(q[..., 1:4], (J_inv@tau_w_i.mT).mT, dim=-1))
+            d_metric_i = torch.sum(dudx[..., 3:6] * u_tilde_i, dim=-1)
+            if i == 0:
+                best_metric = d_metric_i
+                tau_w = tau_w_i
+            else:
+                metric_update_locs = torch.nonzero(torch.where(d_metric_i > best_metric, 1, 0), as_tuple=True)
+                best_metric[metric_update_locs] = d_metric_i[metric_update_locs]
+                tau_w[metric_update_locs] = tau_w_i[metric_update_locs]
+                # best_metric = torch.where(
+                #     d_metric_i > best_metric, d_metric_i, best_metric)
+                # print(best_metric.shape)
+                # print(tau_w.shape)
+                # print(tau_w_i.shape)
+                # tau_w = torch.where(
+                #     d_metric_i > best_metric, tau_w_i[], tau_w)
+
+        omega_dot = (J_inv@(tau_w*thrust - torch.linalg.cross(omega, Omega, dim=-1)).mT).mT
+        # print(
+        #     0.5*(q0*omega_dot + torch.linalg.cross(q[..., 1:4], omega_dot, dim=-1)))
+        # print(torch.sum(omega**2, dim=-1))
+        # print(q[..., 1:])
+        # print(0.25*torch.sum(omega**2, dim=-1)*q[..., 1:])
+        u_tilde = 0.5*(q0*omega_dot + torch.linalg.cross(q[...,1:4], omega_dot, dim=-1)) - 0.25*torch.sum(omega**2, dim=-1)[..., None]*q[...,1:]
+        ham = ham + torch.sum(dudx[..., 3:6] * (x_omega + u_tilde), dim=-1)
+
+        # Control component
+        u_plus = -(torch.sign(dudx[..., 6:]) - 1.0) / 2.0 * omega_max * (-(torch.sign(x[..., 7:] - 0.99) - 1.0) / 2.0)
+        u_minus = -(torch.sign(dudx[..., 6:]) + 1.0) / 2.0 * omega_max * (torch.sign(x[..., 7:] + 0.99) + 1.0) / 2.0
+        u = u_plus + u_minus
+        ham = ham + torch.sum(dudx[..., 6:] * u, dim=-1)
+
+        # If we are computing BRT then take min with zero
+        if minWith == 'zero':
+            ham = torch.clamp(ham, max=0.0)
+
+        if torch.all(dirichlet_mask):
+            diff_constraint_hom = torch.Tensor([0])
+        else:
+            diff_constraint_hom = dudt - ham
+            if minWith == 'target':
+                diff_constraint_hom = torch.max(
+                    diff_constraint_hom[:, :, None], y - source_boundary_values)
+
+        dirichlet = y[dirichlet_mask] - source_boundary_values[dirichlet_mask]
+
+        # if torch.any(torch.isnan(dirichlet)):
+        #     raise Exception('Dirichlet is nan')
+        # if torch.any(torch.isnan(diff_constraint_hom)):
+        #     print(diff_constraint_hom)
+        #     raise Exception('Diff constraint is nan')
+
+        return {'dirichlet': torch.abs(dirichlet).sum() * batch_size / 15e2,
+                'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
+
+    return hji_attitude
